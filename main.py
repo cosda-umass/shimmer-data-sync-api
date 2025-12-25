@@ -6,7 +6,7 @@ import io
 import zipfile
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from collections import defaultdict
 import json
 import traceback
@@ -119,8 +119,8 @@ def download_zip_by_day(date: str = Body(..., embed=True)):
 class DevicePatientRecord(BaseModel):
     device: str
     patient: Optional[str] = None
-    shimmer1: Optional[str] = None
-    shimmer2: Optional[str] = None
+    shimmer1: Optional[List[str]] = None  # List of permissible shimmer1 devices
+    shimmer2: Optional[List[str]] = None  # List of permissible shimmer2 devices
     updatedAt: Optional[str] = None
 
 def parse_file_name(key: str) -> FileItem:
@@ -304,10 +304,11 @@ def get_files_metadata() -> Dict[str, Any]:
         contents = response.get("Contents", [])
         keys = [obj["Key"] for obj in contents]
 
-        # Load device→patient mapping from DynamoDB
+        # Load device→patient mapping and shimmer lists from DynamoDB
         mapping: Dict[str, Optional[str]] = {}
+        shimmer_mapping: Dict[str, Dict[str, Optional[List[str]]]] = {}
         table = _get_ddb_table()
-        scan_kwargs: Dict = {"ProjectionExpression": "device, patient"}
+        scan_kwargs: Dict = {"ProjectionExpression": "device, patient, shimmer1, shimmer2"}
         while True:
             dresp = table.scan(**scan_kwargs)
             for it in dresp.get("Items", []):
@@ -315,6 +316,13 @@ def get_files_metadata() -> Dict[str, Any]:
                 pat = it.get("patient")
                 if dev:
                     mapping[dev] = pat if (pat is not None and pat != "") else None
+                    # Normalize shimmer values to lists (handles backward compatibility)
+                    shimmer1 = _normalize_shimmer_to_list(it.get("shimmer1"))
+                    shimmer2 = _normalize_shimmer_to_list(it.get("shimmer2"))
+                    shimmer_mapping[dev] = {
+                        "shimmer1": shimmer1,
+                        "shimmer2": shimmer2
+                    }
             if "LastEvaluatedKey" in dresp:
                 scan_kwargs["ExclusiveStartKey"] = dresp["LastEvaluatedKey"]
             else:
@@ -386,7 +394,9 @@ def get_files_metadata() -> Dict[str, Any]:
                 "part": part
             }
 
-        grouped = defaultdict(lambda: {"files": [], "patient": None, "shimmer_devices": set()})
+        # Group by (device, date, patient) - pair up all files from same date
+        # Track shimmer devices by type within each date group
+        grouped = defaultdict(lambda: {"files": [], "patient": None, "shimmer1_devices": set(), "shimmer2_devices": set()})
         for k in keys:
             meta = parse_custom_filename(os.path.basename(k))
             device = meta["device"]
@@ -397,20 +407,44 @@ def get_files_metadata() -> Dict[str, Any]:
             timestamp = meta["timestamp"]
             pat = mapping.get(device)
             
+            # Get shimmer mapping for this device
+            device_shimmer_map = shimmer_mapping.get(device, {})
+            s1_list = device_shimmer_map.get("shimmer1")
+            s2_list = device_shimmer_map.get("shimmer2")
+            
+            # Identify which shimmer type this device belongs to based on permissible lists
+            # This ensures new shimmers added to the lists are automatically mapped correctly
+            shimmer_type = None
+            if shimmer_device != "none":
+                # Check if shimmer device is in shimmer1 permissible list
+                if s1_list and isinstance(s1_list, list) and shimmer_device in s1_list:
+                    shimmer_type = "shimmer1"
+                elif s1_list and not isinstance(s1_list, list) and shimmer_device == s1_list:
+                    # Backward compatibility: handle old string format
+                    shimmer_type = "shimmer1"
+                # Check if shimmer device is in shimmer2 permissible list
+                elif s2_list and isinstance(s2_list, list) and shimmer_device in s2_list:
+                    shimmer_type = "shimmer2"
+                elif s2_list and not isinstance(s2_list, list) and shimmer_device == s2_list:
+                    # Backward compatibility: handle old string format
+                    shimmer_type = "shimmer2"
+            
             # Get recordedTimestamp from DynamoDB if available
             file_meta = file_metadata.get(k, {})
             recorded_ts = file_meta.get("recordedTimestamp")
             
-            # Parse date and time from recordedTimestamp if available
+            # ALWAYS use recordedTimestamp date for grouping (paired by actual recording date)
+            # Parse date and time from recordedTimestamp - this is the source of truth
             if recorded_ts:
                 try:
                     # Parse ISO format timestamp (e.g., "2024-09-24T22:38:36+00:00")
                     dt = datetime.fromisoformat(recorded_ts.replace("Z", "+00:00"))
-                    date = dt.strftime("%Y-%m-%d")  # Use date from recordedTimestamp
+                    date = dt.strftime("%Y-%m-%d")  # Use date from recordedTimestamp for grouping
                     time = dt.strftime("%H:%M:%S")  # Use time from recordedTimestamp
                 except (ValueError, AttributeError):
-                    # If parsing fails, keep filename-based date/time
+                    # If parsing fails, keep filename-based date/time as fallback
                     pass
+            # If no recordedTimestamp, use filename date (but these should ideally have recordedTimestamp)
             
             file_record = {
                 "fullname": k,
@@ -426,18 +460,30 @@ def get_files_metadata() -> Dict[str, Any]:
             if recorded_ts:
                 file_record["recordedTimestamp"] = recorded_ts
             
-            # Group by date from recordedTimestamp (if available) or filename
-            grouped[(device, date, pat)]["files"].append(file_record)
-            grouped[(device, date, pat)]["patient"] = pat if (pat is not None and pat != "") else "none"
-            grouped[(device, date, pat)]["experiment_name"] = experiment_name
-            if shimmer_device != "none":
-                grouped[(device, date, pat)]["shimmer_devices"].add(shimmer_device)
+            # Group by (device, date, patient) - all files from same date are paired together
+            group_key = (device, date, pat)
+            
+            grouped[group_key]["files"].append(file_record)
+            grouped[group_key]["patient"] = pat if (pat is not None and pat != "") else "none"
+            grouped[group_key]["experiment_name"] = experiment_name
+            
+            # Track shimmer devices by type - collect all shimmers used on this date
+            if shimmer_device != "none" and shimmer_type:
+                if shimmer_type == "shimmer1":
+                    grouped[group_key]["shimmer1_devices"].add(shimmer_device)
+                elif shimmer_type == "shimmer2":
+                    grouped[group_key]["shimmer2_devices"].add(shimmer_device)
+        
         # Convert to desired output format
         result = []
         for (device, date, patient), value in grouped.items():
-            shimmers = list(value["shimmer_devices"])
-            shimmer1 = shimmers[0] if len(shimmers) > 0 else "none"
-            shimmer2 = shimmers[1] if len(shimmers) > 1 else "none"
+            # Get first shimmer device from each type (if any)
+            # If multiple shimmers of same type exist (e.g., backup), show the first one
+            shimmer1_list = sorted(list(value["shimmer1_devices"]))
+            shimmer2_list = sorted(list(value["shimmer2_devices"]))
+            shimmer1 = shimmer1_list[0] if len(shimmer1_list) > 0 else "none"
+            shimmer2 = shimmer2_list[0] if len(shimmer2_list) > 0 else "none"
+            
             result.append({
                 "device": device,
                 "date": date,
@@ -544,6 +590,21 @@ def download_all_url():
 
 # ---------------------- DynamoDB helpers ----------------------
 
+def _normalize_shimmer_to_list(shimmer_value):
+    """
+    Normalize shimmer value to list format.
+    Converts string to single-item list, keeps list as-is, returns None for None/empty.
+    This ensures all shimmer values are in list format for consistent processing.
+    """
+    if shimmer_value is None:
+        return None
+    if isinstance(shimmer_value, list):
+        return shimmer_value if shimmer_value else None
+    # Convert string to list
+    if isinstance(shimmer_value, str) and shimmer_value.strip():
+        return [shimmer_value]
+    return None
+
 def _get_ddb_table():
     table_name = os.getenv("DDB_TABLE")
     if not table_name:
@@ -562,11 +623,15 @@ def ddb_get_device_patient_map():
         while True:
             resp = table.scan(**scan_kwargs)
             for it in resp.get("Items", []):
+                # Normalize shimmer values to lists (handles backward compatibility)
+                shimmer1 = _normalize_shimmer_to_list(it.get("shimmer1"))
+                shimmer2 = _normalize_shimmer_to_list(it.get("shimmer2"))
+                
                 records.append(DevicePatientRecord(
                     device=it.get("device", ""),
                     patient=it.get("patient"),
-                    shimmer1=it.get("shimmer1"),
-                    shimmer2=it.get("shimmer2"),
+                    shimmer1=shimmer1,
+                    shimmer2=shimmer2,
                     updatedAt=it.get("updatedAt")
                 ))
             if "LastEvaluatedKey" in resp:
@@ -588,11 +653,19 @@ def ddb_get_device_patient_map_details():
         while True:
             resp = table.scan(**scan_kwargs)
             for it in resp.get("Items", []):
+                # Handle backward compatibility: convert string to list if needed
+                shimmer1 = it.get("shimmer1")
+                shimmer2 = it.get("shimmer2")
+                if shimmer1 is not None and not isinstance(shimmer1, list):
+                    shimmer1 = [shimmer1] if shimmer1 else None
+                if shimmer2 is not None and not isinstance(shimmer2, list):
+                    shimmer2 = [shimmer2] if shimmer2 else None
+                
                 records.append(DevicePatientRecord(
                     device=it.get("device", ""),
                     patient=it.get("patient"),
-                    shimmer1=it.get("shimmer1"),
-                    shimmer2=it.get("shimmer2"),
+                    shimmer1=shimmer1,
+                    shimmer2=shimmer2,
                     updatedAt=it.get("updatedAt")
                 ))
             if "LastEvaluatedKey" in resp:
@@ -612,11 +685,20 @@ def ddb_get_device_mapping(device: str):
         item = resp.get("Item")
         if not item:
             raise HTTPException(status_code=404, detail="Device not found")
+        
+        # Handle backward compatibility: convert string to list if needed
+        shimmer1 = item.get("shimmer1")
+        shimmer2 = item.get("shimmer2")
+        if shimmer1 is not None and not isinstance(shimmer1, list):
+            shimmer1 = [shimmer1] if shimmer1 else None
+        if shimmer2 is not None and not isinstance(shimmer2, list):
+            shimmer2 = [shimmer2] if shimmer2 else None
+        
         return {
             "device": device,
             "patient": item.get("patient"),
-            "shimmer1": item.get("shimmer1"),
-            "shimmer2": item.get("shimmer2"),
+            "shimmer1": shimmer1,
+            "shimmer2": shimmer2,
             "updatedAt": item.get("updatedAt")
         }
     except (BotoCoreError, ClientError) as e:
@@ -624,7 +706,7 @@ def ddb_get_device_mapping(device: str):
 
 
 @app.put("/ddb/device-patient-map", response_model=List[DevicePatientRecord])
-def ddb_put_device_patient_map(mapping: Dict[str, str] = Body(...)):
+def ddb_put_device_patient_map(mapping: Dict[str, Any] = Body(...)):
     """Replace the map by writing items and return full records (device, patient, updatedAt)."""
     try:
         table = _get_ddb_table()
@@ -638,6 +720,13 @@ def ddb_put_device_patient_map(mapping: Dict[str, str] = Body(...)):
                     patient = mapping[d].get("patient") if isinstance(mapping[d], dict) else mapping[d]
                     shimmer1 = mapping[d].get("shimmer1") if isinstance(mapping[d], dict) else None
                     shimmer2 = mapping[d].get("shimmer2") if isinstance(mapping[d], dict) else None
+                    
+                    # Convert string to list for backward compatibility
+                    if shimmer1 is not None and not isinstance(shimmer1, list):
+                        shimmer1 = [shimmer1] if shimmer1 else None
+                    if shimmer2 is not None and not isinstance(shimmer2, list):
+                        shimmer2 = [shimmer2] if shimmer2 else None
+                    
                     batch.put_item(Item={
                         "device": d,
                         "patient": patient,
@@ -652,12 +741,19 @@ def ddb_put_device_patient_map(mapping: Dict[str, str] = Body(...)):
 
 
 @app.put("/ddb/device-patient-map/{device}")
-def ddb_put_device_mapping(device: str, payload: Dict[str, str] = Body(...)):
+def ddb_put_device_mapping(device: str, payload: Dict[str, Any] = Body(...)):
     patient = payload.get("patient")
     shimmer1 = payload.get("shimmer1")
     shimmer2 = payload.get("shimmer2")
     if not patient:
         raise HTTPException(status_code=400, detail="'patient' is required")
+    
+    # Convert string to list for backward compatibility
+    if shimmer1 is not None and not isinstance(shimmer1, list):
+        shimmer1 = [shimmer1] if shimmer1 else None
+    if shimmer2 is not None and not isinstance(shimmer2, list):
+        shimmer2 = [shimmer2] if shimmer2 else None
+    
     try:
         table = _get_ddb_table()
         ts = datetime.now(timezone.utc).isoformat()
@@ -1196,9 +1292,13 @@ def get_combined_meta():
                 for it in mresp.get("Items", []):
                     dev = it.get("device")
                     if dev:
+                        # Normalize shimmer values to lists (handles backward compatibility)
+                        shimmer1 = _normalize_shimmer_to_list(it.get("shimmer1"))
+                        shimmer2 = _normalize_shimmer_to_list(it.get("shimmer2"))
+                        
                         shimmer_map[dev] = {
-                            "shimmer1": it.get("shimmer1"),
-                            "shimmer2": it.get("shimmer2"),
+                            "shimmer1": shimmer1,
+                            "shimmer2": shimmer2,
                         }
                 if "LastEvaluatedKey" in mresp:
                     scan_kwargs["ExclusiveStartKey"] = mresp["LastEvaluatedKey"]
@@ -1227,10 +1327,17 @@ def get_combined_meta():
             for rec in recs:
                 shimmer_name = rec["shimmer_name"]
 
-                # Identify shimmer type
-                if shimmer_name == s1:
+                # Identify shimmer type - check if shimmer_name is in the list
+                # This ensures new shimmers added to the lists are automatically mapped correctly
+                if s1 and isinstance(s1, list) and shimmer_name in s1:
                     shimmer_type = "shimmer1"
-                elif shimmer_name == s2:
+                elif s1 and not isinstance(s1, list) and shimmer_name == s1:
+                    # Backward compatibility: handle old string format
+                    shimmer_type = "shimmer1"
+                elif s2 and isinstance(s2, list) and shimmer_name in s2:
+                    shimmer_type = "shimmer2"
+                elif s2 and not isinstance(s2, list) and shimmer_name == s2:
+                    # Backward compatibility: handle old string format
                     shimmer_type = "shimmer2"
                 else:
                     # fallback
@@ -1517,4 +1624,43 @@ def get_decoded_field_direct(
         }
     except (BotoCoreError, ClientError, Exception) as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/get-decoded-file-url/")
+def get_decoded_file_url(full_file_name: str = Query(...)):
+    """
+    Returns a presigned URL to download the decoded JSON file from S3.
+    Takes the original filename and returns download URL for decode/{filename}_decoded.json
+    
+    IMPORTANT: Use ONLY the "download_url" field from the response. The URL must be used
+    exactly as returned - any modification will break the signature.
+    """
+    try:
+        import os
+        decoded_key = f"decode/{os.path.splitext(full_file_name)[0]}_decoded.json"
+        
+        # Verify file exists first
+        try:
+            s3_client.head_object(Bucket=S3_BUCKET, Key=decoded_key)
+        except ClientError as e:
+            if e.response['Error']['Code'] == '404':
+                raise HTTPException(status_code=404, detail=f"Decoded file not found: {decoded_key}")
+            raise
+        
+        # Generate presigned URL - use exactly as returned, don't modify!
+        url = s3_client.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={
+                "Bucket": S3_BUCKET,
+                "Key": decoded_key
+            },
+            ExpiresIn=3600  # 1 hour
+        )
+        
+        return {"download_url": url, "s3_key": decoded_key}
+    except HTTPException:
+        raise
+    except (BotoCoreError, ClientError, Exception) as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
