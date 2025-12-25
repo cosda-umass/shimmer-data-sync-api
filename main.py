@@ -1663,4 +1663,49 @@ def get_decoded_file_url(full_file_name: str = Query(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Daily aggregator endpoint - can be called manually or scheduled
+@app.post("/daily-aggregator/")
+def trigger_daily_aggregator(date: Optional[str] = Body(None, embed=True)):
+    """
+    Trigger daily aggregation for a specific date or automatically process next date.
+    Uses recordedTimestamp from DynamoDB to determine actual recording date.
+    """
+    try:
+        from daily_aggregator_handler import (
+            lambda_handler,
+            get_next_date_to_process
+        )
+        
+        # Determine date to process
+        target_date = date
+        if not target_date:
+            target_date = get_next_date_to_process()
+        
+        if not target_date:
+            return {
+                "message": "No date to process (all dates up to today are processed)",
+                "last_processed": None
+            }
+        
+        # Create event for lambda handler
+        event = {"date": target_date}
+        
+        # Call the handler
+        response = lambda_handler(event, None)
+        
+        # Parse response body
+        body = json.loads(response["body"])
+        
+        if response["statusCode"] == 200:
+            return body
+        else:
+            raise HTTPException(status_code=response["statusCode"], detail=body)
+    
+    except ImportError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not import daily_aggregator_handler: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
