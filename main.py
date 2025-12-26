@@ -302,7 +302,29 @@ def get_files_metadata() -> Dict[str, Any]:
     try:
         response = s3_client.list_objects_v2(Bucket=S3_BUCKET)
         contents = response.get("Contents", [])
-        keys = [obj["Key"] for obj in contents]
+        # Filter out combined files, decode folder, daily-aggregated folder, and zip files
+        keys = [
+            obj["Key"] for obj in contents 
+            if not (obj["Key"].startswith("combinedbyDay/") or 
+                   obj["Key"].startswith("decode/") or 
+                   obj["Key"].startswith("daily-aggregated/") or
+                   obj["Key"].endswith(".zip"))
+        ]
+        
+        # Continue pagination if needed
+        while response.get("IsTruncated"):
+            response = s3_client.list_objects_v2(
+                Bucket=S3_BUCKET,
+                ContinuationToken=response.get("NextContinuationToken")
+            )
+            for obj in response.get("Contents", []):
+                key = obj.get("Key")
+                # Filter out combined files, decode folder, daily-aggregated folder, and zip files
+                if not (key.startswith("combinedbyDay/") or 
+                       key.startswith("decode/") or 
+                       key.startswith("daily-aggregated/") or
+                       key.endswith(".zip")):
+                    keys.append(key)
 
         # Load device→patient mapping and shimmer lists from DynamoDB
         mapping: Dict[str, Optional[str]] = {}
@@ -809,6 +831,9 @@ def get_unregistered_devices():
             key = obj.get("Key")
             if not key:
                 continue
+            # Skip combined files, decode folder, daily-aggregated folder, and zip files
+            if key.startswith("combinedbyDay/") or key.startswith("decode/") or key.startswith("daily-aggregated/") or key.endswith(".zip"):
+                continue
             dev = parse_file_name(key).device
             if dev:
                 devices_in_s3.add(dev)
@@ -820,6 +845,9 @@ def get_unregistered_devices():
             for obj in resp.get("Contents", []):
                 key = obj.get("Key")
                 if not key:
+                    continue
+                # Skip combined files, decode folder, daily-aggregated folder, and zip files
+                if key.startswith("combinedbyDay/") or key.startswith("decode/") or key.startswith("daily-aggregated/") or key.endswith(".zip"):
                     continue
                 dev = parse_file_name(key).device
                 if dev:
