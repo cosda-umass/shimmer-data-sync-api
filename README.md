@@ -51,6 +51,15 @@ RESTful API for managing and processing Shimmer wearable sensor data in the clou
 - Summary metrics only → DynamoDB (stays under 400KB limit)
 - Scalable architecture for large sensor datasets
 
+### Daily Data Aggregation
+- Scheduled Lambda service to combine daily Shimmer sensor data
+- Combines all hourly files for a day based on `recordedTimestamp` (not filename sync date)
+- Downsampling: Averages every 50 consecutive `Accel_WR_Absolute` points into one
+- UWB counting: Counts total non-zero `uwbDis` values across all hourly files
+- Stores combined data in `combinedbyDay/` folder: `device_date_shimmername_combined.json`
+- Tracks last processed date to avoid reprocessing
+- Groups by unique shimmer device per day (separate files for shimmer1 and shimmer2)
+
 ### Flexible Time-Based Grouping for Shimmer Data
 - Decoded records are grouped by device and patient, then split into groups where all records are within a tunable time window (default: 15 seconds) of each other, regardless of date boundaries.
 - Each group is assigned a unique `group_id` (e.g., `group1`, `group2`, ...) based on the earliest timestamp in the group.
@@ -167,6 +176,26 @@ RESTful API for managing and processing Shimmer wearable sensor data in the clou
 - `PUT /ddb/device-patient-map/{device}` - Create/update mapping
 - `DELETE /ddb/device-patient-map/{device}` - Delete mapping
 - `GET /devices/unregistered` - Find devices without patient mapping
+
+### Daily Data Aggregation
+- `POST /daily-aggregator/` - Trigger daily aggregation for a specific date or automatically process next date
+  - Uses `recordedTimestamp` from DynamoDB to determine actual recording date
+  - Combines all hourly files for a day, downsamples `Accel_WR_Absolute` (averages every 50 points), and counts non-zero `uwbDis` values
+  - Saves combined data to `combinedbyDay/` folder with format: `device_date_shimmername_combined.json`
+  - Request body (optional): `{"date": "2025-12-11"}` - if omitted, processes next unprocessed date
+  - Can be scheduled via EventBridge (e.g., daily at 11:45 PM IST)
+
+### Combined Data Files
+- `GET /combined-data-files/` - List all combined data files from `combinedbyDay/` folder
+  - Groups by date and device
+  - Shows patient mapping and shimmer assignments (shimmer1/shimmer2 based on device mapping)
+  - Returns: `[{date, patient, shimmer1, shimmer2, shimmer1_file, shimmer2_file}, ...]`
+- `GET /get-combined-data-file/` - Get full content of a combined data file
+  - Query params: `filename` (e.g., `device_2025-12-11_Shimmer_DCFF_combined.json`)
+  - For files >5MB, returns presigned URL; otherwise returns full JSON content
+- `GET /get-combined-data-field/` - Get a specific field from a combined data file
+  - Query params: `filename`, `field_name` (e.g., `accel_wr_absolute_downsampled` or `uwb_dis_non_zero_count`)
+  - Returns the field value (useful for charting/visualization)
 
 ## Architecture Notes
 
