@@ -1010,6 +1010,14 @@ def get_deconstructed_files():
         response = s3_client.list_objects_v2(Bucket=S3_BUCKET)
         contents = response.get("Contents", [])
         
+        # Continue pagination if needed
+        while response.get("IsTruncated"):
+            response = s3_client.list_objects_v2(
+                Bucket=S3_BUCKET,
+                ContinuationToken=response.get("NextContinuationToken")
+            )
+            contents.extend(response.get("Contents", []))
+        
         def parse_custom_filename(fname):
             parts = fname.split("__")
             device = parts[0] if len(parts) > 0 else "none"
@@ -1059,8 +1067,11 @@ def get_deconstructed_files():
         result = []
         for obj in contents:
             key = obj["Key"]
-            # Skip .zip files and files in the decode folder
-            if key.lower().endswith('.zip') or key.startswith("decode/"):
+            # Skip .zip files, decode folder, combinedbyDay folder, and daily-aggregated folder
+            if (key.lower().endswith('.zip') or 
+                key.startswith("decode/") or 
+                key.startswith("combinedbyDay/") or 
+                key.startswith("daily-aggregated/")):
                 continue
             parsed = parse_custom_filename(key)
             result.append(parsed)
