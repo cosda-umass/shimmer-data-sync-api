@@ -1709,3 +1709,267 @@ def trigger_daily_aggregator(date: Optional[str] = Body(None, embed=True)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+class CombinedDataFile(BaseModel):
+    date: str
+    patient: Optional[str] = None
+    shimmer1: Optional[str] = None
+    shimmer2: Optional[str] = None
+    shimmer1_file: Optional[str] = None
+    shimmer2_file: Optional[str] = None
+
+
+@app.get("/combined-data-files/", response_model=List[CombinedDataFile])
+def list_combined_data_files():
+    """
+    List all combined data files from S3 combinedbyDay/ folder.
+    Groups by date and device, shows patient mapping and shimmer assignments.
+    """
+    try:
+        # List files from S3 combinedbyDay/ folder
+        prefix = "combinedbyDay/"
+        response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
+        contents = response.get("Contents", [])
+        
+        # Continue pagination if needed
+        while response.get("IsTruncated"):
+            response = s3_client.list_objects_v2(
+                Bucket=S3_BUCKET,
+                Prefix=prefix,
+                ContinuationToken=response.get("NextContinuationToken")
+            )
+            contents.extend(response.get("Contents", []))
+        
+        # Parse filenames: device_date_shimmername_combined.json
+        parsed_files = []
+        for obj in contents:
+            key = obj["Key"]
+            filename = os.path.basename(key)
+            
+            # Skip if not a combined file
+            if not filename.endswith("_combined.json"):
+                continue
+            
+            # Parse: device_date_shimmername_combined.json
+            # Remove _combined.json
+            base = filename.replace("_combined.json", "")
+            parts = base.split("_")
+            
+            if len(parts) >= 3:
+                device = parts[0]
+                date = parts[1]
+                shimmer_name = "_".join(parts[2:])  # Handle shimmer names with underscores
+                
+                parsed_files.append({
+                    "device": device,
+                    "date": date,
+                    "shimmer_name": shimmer_name,
+                    "filename": filename,
+                    "s3_key": key
+                })
+        
+        # Load device-patient mapping and shimmer lists
+        device_mapping = {}
+        shimmer_mapping = {}
+        table = _get_ddb_table()
+        scan_kwargs = {"ProjectionExpression": "device, patient, shimmer1, shimmer2"}
+        while True:
+            dresp = table.scan(**scan_kwargs)
+            for it in dresp.get("Items", []):
+                dev = it.get("device")
+                pat = it.get("patient")
+                if dev:
+                    device_mapping[dev] = pat if (pat is not None and pat != "") else None
+                    # Normalize shimmer values to lists
+                    shimmer1 = _normalize_shimmer_to_list(it.get("shimmer1"))
+                    shimmer2 = _normalize_shimmer_to_list(it.get("shimmer2"))
+                    shimmer_mapping[dev] = {
+                        "shimmer1": shimmer1,
+                        "shimmer2": shimmer2
+                    }
+            if "LastEvaluatedKey" in dresp:
+                scan_kwargs["ExclusiveStartKey"] = dresp["LastEvaluatedKey"]
+            else:
+                break
+        
+        # Group by (date, device)
+        from collections import defaultdict
+        grouped = defaultdict(lambda: {
+            "date": None,
+            "device": None,
+            "patient": None,
+            "shimmer1": None,
+            "shimmer2": None,
+            "shimmer1_file": None,
+            "shimmer2_file": None
+        })
+        
+        for file_info in parsed_files:
+            device = file_info["device"]
+            date = file_info["date"]
+            shimmer_name = file_info["shimmer_name"]
+            filename = file_info["filename"]
+            
+            group_key = (date, device)
+            group = grouped[group_key]
+            
+            # Set date and device
+            group["date"] = date
+            group["device"] = device
+            
+            # Get patient
+            patient = device_mapping.get(device)
+            group["patient"] = patient if (patient is not None and patient != "") else None
+            
+            # Get shimmer mapping for this device
+            device_shimmer_map = shimmer_mapping.get(device, {})
+            s1_list = device_shimmer_map.get("shimmer1")
+            s2_list = device_shimmer_map.get("shimmer2")
+            
+            # Determine if this shimmer is shimmer1 or shimmer2
+            shimmer_type = None
+            if shimmer_name != "unknown":
+                # Check if shimmer is in shimmer1 list
+                if s1_list and isinstance(s1_list, list) and shimmer_name in s1_list:
+                    shimmer_type = "shimmer1"
+                elif s1_list and not isinstance(s1_list, list) and shimmer_name == s1_list:
+                    shimmer_type = "shimmer1"
+                # Check if shimmer is in shimmer2 list
+                elif s2_list and isinstance(s2_list, list) and shimmer_name in s2_list:
+                    shimmer_type = "shimmer2"
+                elif s2_list and not isinstance(s2_list, list) and shimmer_name == s2_list:
+                    shimmer_type = "shimmer2"
+            
+            # Assign to shimmer1 or shimmer2
+            if shimmer_type == "shimmer1":
+                group["shimmer1"] = shimmer_name
+                group["shimmer1_file"] = filename
+            elif shimmer_type == "shimmer2":
+                group["shimmer2"] = shimmer_name
+                group["shimmer2_file"] = filename
+            else:
+                # If not in mapping, assign to first available slot
+                if not group["shimmer1"]:
+                    group["shimmer1"] = shimmer_name
+                    group["shimmer1_file"] = filename
+                elif not group["shimmer2"]:
+                    group["shimmer2"] = shimmer_name
+                    group["shimmer2_file"] = filename
+        
+        # Convert to response format
+        result = []
+        for (date, device), group in sorted(grouped.items()):
+            result.append(CombinedDataFile(
+                date=group["date"],
+                patient=group["patient"],
+                shimmer1=group["shimmer1"],
+                shimmer2=group["shimmer2"],
+                shimmer1_file=group["shimmer1_file"],
+                shimmer2_file=group["shimmer2_file"]
+            ))
+        
+        return result
+    
+    except (BotoCoreError, ClientError, Exception) as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/get-combined-data-field/")
+def get_combined_data_field(
+    filename: str = Query(..., description="Combined file name, e.g., device_date_shimmername_combined.json"),
+    field_name: str = Query(..., description="Field name: 'accel_wr_absolute_downsampled' or 'uwb_dis_non_zero_count'")
+):
+    """
+    Get a specific field from a combined data file in combinedbyDay/ folder.
+    Similar to get-decoded-field-direct but for combined files.
+    """
+    try:
+        import json
+        
+        # Ensure filename is in combinedbyDay/ folder
+        if not filename.startswith("combinedbyDay/"):
+            s3_key = f"combinedbyDay/{filename}"
+        else:
+            s3_key = filename
+        
+        # Load combined data from S3
+        s3_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+        combined_data = json.loads(s3_obj["Body"].read().decode("utf-8"))
+        
+        if field_name not in combined_data:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Field '{field_name}' not found. Available fields: {list(combined_data.keys())}"
+            )
+        
+        field_value = combined_data[field_name]
+        
+        return {
+            "s3_key": s3_key,
+            "field": field_name,
+            "length": len(field_value) if isinstance(field_value, list) else None,
+            "values": field_value,  # Return full array (can be large ~58k points)
+            "is_array": isinstance(field_value, list)
+        }
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            raise HTTPException(status_code=404, detail=f"Combined file not found: {s3_key}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/get-combined-data-file/")
+def get_combined_data_file(
+    filename: str = Query(..., description="Combined file name, e.g., device_date_shimmername_combined.json")
+):
+    """
+    Get the full content of a combined data file from combinedbyDay/ folder.
+    Returns presigned URL for large files, or full content for small files.
+    """
+    try:
+        import json
+        
+        # Ensure filename is in combinedbyDay/ folder
+        if not filename.startswith("combinedbyDay/"):
+            s3_key = f"combinedbyDay/{filename}"
+        else:
+            s3_key = filename
+        
+        # Check file size first
+        try:
+            head_response = s3_client.head_object(Bucket=S3_BUCKET, Key=s3_key)
+            file_size = head_response.get('ContentLength', 0)
+        except ClientError as e:
+            if e.response['Error']['Code'] == '404':
+                raise HTTPException(status_code=404, detail=f"Combined file not found: {s3_key}")
+            raise
+        
+        # If file is large (>5MB), return presigned URL instead
+        if file_size > 5 * 1024 * 1024:  # 5MB
+            url = s3_client.generate_presigned_url(
+                ClientMethod="get_object",
+                Params={"Bucket": S3_BUCKET, "Key": s3_key},
+                ExpiresIn=3600
+            )
+            return {
+                "s3_key": s3_key,
+                "file_size": file_size,
+                "download_url": url,
+                "note": "File is large, use download_url to fetch"
+            }
+        
+        # For smaller files, return full content
+        s3_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+        combined_data = json.loads(s3_obj["Body"].read().decode("utf-8"))
+        
+        return {
+            "s3_key": s3_key,
+            "file_size": file_size,
+            "data": combined_data
+        }
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            raise HTTPException(status_code=404, detail=f"Combined file not found: {s3_key}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
