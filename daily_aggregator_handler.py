@@ -127,28 +127,35 @@ def get_files_for_date(target_date: str) -> List[Dict[str, Any]]:
             response = table.scan(**scan_kwargs)
             scanned_count += response.get("Count", 0)
             
-            # Filter items by date extracted from recordedTimestamp
+            # Filter items by date extracted from recordedTimestamp (STRICT - only recordedTimestamp date)
             for item in response.get("Items", []):
                 recorded_ts = item.get("recordedTimestamp")
                 
-                if recorded_ts:
-                    # Extract date from recordedTimestamp
-                    item_date = extract_date_from_recorded_timestamp(recorded_ts)
-                    if item_date == target_date:
-                        files.append(item)
+                if not recorded_ts or recorded_ts == "unknown" or recorded_ts == "":
+                    # Skip files without recordedTimestamp - DO NOT use filename date
+                    print(f"  Skipped file: {item.get('full_file_name')} - no recordedTimestamp")
+                    continue
+                
+                # Extract date from recordedTimestamp (ONLY source of truth - ignore filename date completely)
+                item_date = extract_date_from_recorded_timestamp(recorded_ts)
+                if not item_date:
+                    print(f"  Skipped file: {item.get('full_file_name')} - could not extract date from recordedTimestamp: {recorded_ts}")
+                    continue
+                
+                # STRICT match: only include if extracted date exactly matches target_date
+                if item_date == target_date:
+                    files.append(item)
+                    print(f"  ✓ Included file: {item.get('full_file_name')} with recordedTimestamp: {recorded_ts} (extracted date: {item_date})")
                 else:
-                    # Fallback: use date field if recordedTimestamp is missing
-                    item_date = item.get("date")
-                    if item_date == target_date:
-                        print(f"Warning: Using fallback date field for {item.get('full_file_name')}")
-                        files.append(item)
+                    print(f"  ✗ Skipped file: {item.get('full_file_name')} - recordedTimestamp date {item_date} != target_date {target_date} (recordedTimestamp: {recorded_ts})")
             
             if "LastEvaluatedKey" in response:
                 scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
             else:
                 break
         
-        print(f"Scanned {scanned_count} items, found {len(files)} files for date {target_date}")
+        print(f"Scanned {scanned_count} items, found {len(files)} files with recordedTimestamp date matching {target_date}")
+        print(f"IMPORTANT: Only files where recordedTimestamp date == {target_date} are included (filename dates are IGNORED)")
         return files
     
     except ClientError as e:
@@ -211,11 +218,32 @@ def aggregate_daily_data_by_shimmer(target_date: str, shimmer_device: str, devic
     """
     print(f"Processing date: {target_date}, device: {device}, shimmer: {shimmer_device}")
     
-    # Filter files for this specific shimmer device
-    shimmer_files = [
-        f for f in file_records 
-        if f.get("device") == device and f.get("shimmer_device") == shimmer_device
-    ]
+    # Filter files for this specific shimmer device AND must have recordedTimestamp
+    # AND the recordedTimestamp date must match the target_date
+    shimmer_files = []
+    print(f"  Filtering {len(file_records)} file records for device={device}, shimmer={shimmer_device}, date={target_date}")
+    for f in file_records:
+        recorded_ts = f.get("recordedTimestamp")
+        f_device = f.get("device")
+        f_shimmer = f.get("shimmer_device")
+        
+        # Must have recordedTimestamp
+        if not recorded_ts or recorded_ts == "unknown":
+            print(f"  Skipping {f.get('full_file_name')}: no recordedTimestamp")
+            continue
+        
+        # Must match device and shimmer_device
+        if f_device != device or f_shimmer != shimmer_device:
+            print(f"  Skipping {f.get('full_file_name')}: device={f_device} (expected {device}) or shimmer={f_shimmer} (expected {shimmer_device})")
+            continue
+        
+        # Verify the recordedTimestamp date matches target_date
+        file_date = extract_date_from_recorded_timestamp(recorded_ts)
+        if file_date == target_date:
+            shimmer_files.append(f)
+            print(f"  ✓ Including file: {f.get('full_file_name')} (recordedTimestamp: {recorded_ts}, date: {file_date})")
+        else:
+            print(f"  ✗ Skipping file {f.get('full_file_name')}: recordedTimestamp date {file_date} != target_date {target_date} (recordedTimestamp: {recorded_ts})")
     
     if not shimmer_files:
         return {
@@ -227,14 +255,35 @@ def aggregate_daily_data_by_shimmer(target_date: str, shimmer_device: str, devic
         }
     
     print(f"Found {len(shimmer_files)} files for {device}/{shimmer_device} on {target_date}")
+    print(f"  File list:")
+    for idx, f in enumerate(shimmer_files, 1):
+        print(f"    {idx}. {f.get('full_file_name')} (recordedTimestamp: {f.get('recordedTimestamp')})")
+    # Note: Files are already sorted by recordedTimestamp in ascending order before calling this function
+    
+    # Deduplicate within this group to ensure each file is only processed once
+    seen_in_group = set()
+    unique_shimmer_files = []
+    for f in shimmer_files:
+        full_name = f.get("full_file_name")
+        if full_name and full_name not in seen_in_group:
+            seen_in_group.add(full_name)
+            unique_shimmer_files.append(f)
+        elif full_name:
+            print(f"  WARNING: Duplicate file in group: {full_name} - skipping")
+    
+    if len(unique_shimmer_files) != len(shimmer_files):
+        print(f"  WARNING: Found {len(shimmer_files) - len(unique_shimmer_files)} duplicate files in group, using {len(unique_shimmer_files)} unique files")
     
     # Collect data from all files for this shimmer
     all_accel_wr = []
     total_uwb_non_zero = 0
     files_processed = 0
     files_failed = []
+    files_processed_list = []  # Track successfully processed file names
+    file_timestamps = []  # Track timestamps for each file
+    file_sample_counts = []  # Track how many samples each file contributes (for downsampling calculation)
     
-    for file_record in shimmer_files:
+    for file_record in unique_shimmer_files:
         decode_s3_key = file_record.get("decode_s3_key")
         full_file_name = file_record.get("full_file_name", "unknown")
         recorded_ts = file_record.get("recordedTimestamp", "unknown")
@@ -259,12 +308,20 @@ def aggregate_daily_data_by_shimmer(target_date: str, shimmer_device: str, devic
         
         print(f"Processing: {full_file_name} (recorded: {recorded_ts})")
         
+        # Track file timestamp (just use recordedTimestamp from DynamoDB, no calculations)
+        file_info = {
+            "filename": full_file_name,
+            "timestamp": recorded_ts if recorded_ts != "unknown" else None
+        }
+        
         # Extract Accel_WR_Absolute
         if "Accel_WR_Absolute" in decoded_data:
             accel_data = decoded_data["Accel_WR_Absolute"]
             if isinstance(accel_data, list):
                 count = len(accel_data)
                 all_accel_wr.extend([float(v) for v in accel_data])
+                file_info["accel_samples"] = count
+                file_sample_counts.append(count)  # Track sample count for this file
                 print(f"  Accel_WR_Absolute samples: {count}")
             else:
                 print(f"  Warning: Accel_WR_Absolute is not a list")
@@ -277,12 +334,16 @@ def aggregate_daily_data_by_shimmer(target_date: str, shimmer_device: str, devic
             if isinstance(uwb_data, list):
                 count = count_non_zero_uwb([float(v) for v in uwb_data])
                 total_uwb_non_zero += count
+                file_info["uwb_samples"] = len(uwb_data)
+                file_info["uwb_non_zero_count"] = count
                 print(f"  uwbDis non-zero count: {count} (total samples: {len(uwb_data)})")
             else:
                 print(f"  Warning: uwbDis is not a list")
         else:
             print(f"  Warning: uwbDis not found in file")
         
+        file_timestamps.append(file_info)
+        files_processed_list.append(full_file_name)
         files_processed += 1
     
     print(f"\nSummary:")
@@ -294,6 +355,18 @@ def aggregate_daily_data_by_shimmer(target_date: str, shimmer_device: str, devic
     # Downsample Accel_WR_Absolute: average every 50 points into 1
     accel_downsampled = downsample_by_chunk_size(all_accel_wr, DOWNSAMPLE_CHUNK_SIZE)
     
+    # Calculate how many downsampled samples each file contributes
+    # This tells the UI which indices in accel_wr_absolute_downsampled belong to which file
+    downsampled_index = 0
+    for i, file_info in enumerate(file_timestamps):
+        original_samples = file_sample_counts[i] if i < len(file_sample_counts) else file_info.get("accel_samples", 0)
+        # Calculate downsampled count: ceil(original_samples / DOWNSAMPLE_CHUNK_SIZE)
+        downsampled_count = (original_samples + DOWNSAMPLE_CHUNK_SIZE - 1) // DOWNSAMPLE_CHUNK_SIZE
+        file_info["downsampled_samples"] = downsampled_count
+        file_info["downsampled_start_index"] = downsampled_index
+        file_info["downsampled_end_index"] = downsampled_index + downsampled_count - 1
+        downsampled_index += downsampled_count
+    
     result = {
         "date": target_date,
         "device": device,
@@ -301,6 +374,8 @@ def aggregate_daily_data_by_shimmer(target_date: str, shimmer_device: str, devic
         "files_processed": files_processed,
         "files_total": len(shimmer_files),
         "files_failed": len(files_failed),
+        "files_processed_list": files_processed_list,  # List of file names that were successfully processed
+        "file_timestamps": file_timestamps,  # Each file has: filename, timestamp (start time), accel_samples (count), downsampled_samples, indices
         "accel_wr_absolute": {
             "original_count": len(all_accel_wr),
             "downsampled": accel_downsampled,
@@ -330,13 +405,14 @@ def save_aggregated_data(result: Dict[str, Any]):
     # Save simplified combined data
     # Structure: device_date_shimmername_combined.json
     combined_data = {
-        "date": date,
-        "device": device,
-        "shimmer_device": shimmer_device,
-        "accel_wr_absolute_downsampled": result.get("accel_wr_absolute", {}).get("downsampled", []),
-        "uwb_dis_non_zero_count": result.get("uwb_dis", {}).get("non_zero_count", 0),
-        "processed_at": result.get("processed_at")
-    }
+            "date": date,
+            "device": device,
+            "shimmer_device": shimmer_device,
+            "accel_wr_absolute_downsampled": result.get("accel_wr_absolute", {}).get("downsampled", []),
+            "uwb_dis_non_zero_count": result.get("uwb_dis", {}).get("non_zero_count", 0),
+            "file_timestamps": result.get("file_timestamps", []),  # Each file: filename, timestamp (start), accel_samples (count), downsampled_samples, indices
+            "processed_at": result.get("processed_at")
+        }
     
     s3_key = f"{OUTPUT_S3_PREFIX}{device}_{date}_{shimmer_clean}_combined.json"
     
@@ -445,7 +521,9 @@ def lambda_handler(event, context):
                 })
             }
         
-        # Get all files for this date
+        print(f"=== Processing date: {target_date} (based on recordedTimestamp, NOT filename) ===")
+        
+        # Get all files for this date - ONLY files where recordedTimestamp date matches target_date
         file_records = get_files_for_date(target_date)
         
         if not file_records:
@@ -457,10 +535,37 @@ def lambda_handler(event, context):
                 })
             }
         
+        # Filter: Only include files that have recordedTimestamp AND date matches target_date
+        files_with_timestamp = []
+        for f in file_records:
+            if f.get("recordedTimestamp") and f.get("recordedTimestamp") != "unknown":
+                # Verify the recordedTimestamp date matches target_date
+                recorded_ts = f.get("recordedTimestamp")
+                file_date = extract_date_from_recorded_timestamp(recorded_ts)
+                if file_date == target_date:
+                    files_with_timestamp.append(f)
+                else:
+                    print(f"  Skipping file {f.get('full_file_name')}: recordedTimestamp date {file_date} != target_date {target_date}")
+        
+        print(f"Filtered to {len(files_with_timestamp)} files with recordedTimestamp matching date {target_date} (out of {len(file_records)} total)")
+        
+        # Deduplicate files by full_file_name to avoid processing same file multiple times
+        seen_files = set()
+        unique_files = []
+        for file_record in files_with_timestamp:
+            full_name = file_record.get("full_file_name")
+            if full_name and full_name not in seen_files:
+                seen_files.add(full_name)
+                unique_files.append(file_record)
+            elif full_name:
+                print(f"  Skipping duplicate file: {full_name}")
+        
+        print(f"After deduplication: {len(unique_files)} unique files")
+        
         # Group files by (device, shimmer_device)
         from collections import defaultdict
         grouped = defaultdict(list)
-        for file_record in file_records:
+        for file_record in unique_files:
             device = file_record.get("device", "unknown")
             shimmer_device = file_record.get("shimmer_device", "unknown")
             # Extract shimmer_device from full_file_name if not in record
@@ -475,11 +580,22 @@ def lambda_handler(event, context):
                         shimmer_device = shimmer_field
             
             grouped[(device, shimmer_device)].append(file_record)
+            print(f"  Grouped file {file_record.get('full_file_name')} into group: device={device}, shimmer={shimmer_device}")
         
-        # Process each shimmer group separately
+        # Process each shimmer group separately, sorted by recordedTimestamp
         results = []
         for (device, shimmer_device), files in grouped.items():
-            result = aggregate_daily_data_by_shimmer(target_date, shimmer_device, device, file_records)
+            print(f"\n=== Processing group: device={device}, shimmer={shimmer_device} ===")
+            print(f"  Files in this group: {len(files)}")
+            for idx, f in enumerate(files, 1):
+                print(f"    {idx}. {f.get('full_file_name')} (recordedTimestamp: {f.get('recordedTimestamp')}, shimmer_device in DB: {f.get('shimmer_device', 'NOT SET')})")
+            
+            # Sort files by recordedTimestamp in ascending order before processing
+            files_sorted = sorted(
+                files,
+                key=lambda f: f.get("recordedTimestamp", "") or ""
+            )
+            result = aggregate_daily_data_by_shimmer(target_date, shimmer_device, device, files_sorted)
             
             if "error" not in result:
                 # Save results for this shimmer
@@ -489,6 +605,7 @@ def lambda_handler(event, context):
                     "device": device,
                     "shimmer_device": shimmer_device,
                     "files_processed": result["files_processed"],
+                    "files_processed_list": result.get("files_processed_list", []),  # List of file names from DynamoDB
                     "accel_downsampled_count": result["accel_wr_absolute"]["downsampled_count"],
                     "uwb_non_zero_count": result["uwb_dis"]["non_zero_count"],
                     "s3_key": f"{OUTPUT_S3_PREFIX}{device}_{target_date}_{shimmer_clean}_combined.json"
