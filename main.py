@@ -2012,3 +2012,185 @@ def get_combined_data_file(
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/daily-aggregator/backfill/")
+def backfill_missing_dates(limit: Optional[int] = Body(None, embed=True)):
+    """
+    Find all dates that have files in S3/DynamoDB but no combined files in combinedbyDay/,
+    then process all missing dates.
+    
+    Request body (optional): {"limit": 10} - limits number of dates to process in one run
+    """
+    try:
+        from daily_aggregator_handler import (
+            lambda_handler,
+            get_files_for_date,
+            extract_date_from_recorded_timestamp
+        )
+        from collections import defaultdict
+        
+        # Step 1: Get all unique dates from DynamoDB file records
+        print("Scanning DynamoDB for all file dates...")
+        ddb = boto3.resource("dynamodb")
+        file_table_name = os.getenv("DDB_FILE_TABLE")
+        if not file_table_name:
+            raise HTTPException(status_code=500, detail="DDB_FILE_TABLE env not set")
+        
+        file_table = ddb.Table(file_table_name)
+        all_dates = set()
+        
+        scan_kwargs = {
+            "ProjectionExpression": "recordedTimestamp, #date",
+            "ExpressionAttributeNames": {"#date": "date"}
+        }
+        
+        while True:
+            response = file_table.scan(**scan_kwargs)
+            for item in response.get("Items", []):
+                recorded_ts = item.get("recordedTimestamp")
+                if recorded_ts:
+                    date = extract_date_from_recorded_timestamp(recorded_ts)
+                    if date:
+                        all_dates.add(date)
+                else:
+                    # Fallback to date field
+                    date = item.get("date")
+                    if date and date != "none":
+                        all_dates.add(date)
+            
+            if "LastEvaluatedKey" in response:
+                scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+            else:
+                break
+        
+        print(f"Found {len(all_dates)} unique dates in DynamoDB")
+        
+        # Step 2: Get all existing combined files from S3
+        print("Checking existing combined files in S3...")
+        prefix = "combinedbyDay/"
+        processed_dates = set()
+        
+        response = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
+        contents = response.get("Contents", [])
+        
+        while response.get("IsTruncated"):
+            response = s3_client.list_objects_v2(
+                Bucket=S3_BUCKET,
+                Prefix=prefix,
+                ContinuationToken=response.get("NextContinuationToken")
+            )
+            contents.extend(response.get("Contents", []))
+        
+        # Extract dates from combined file names: device_date_shimmername_combined.json
+        for obj in contents:
+            key = obj["Key"]
+            filename = os.path.basename(key)
+            if filename.endswith("_combined.json"):
+                # Parse date from filename: device_YYYY-MM-DD_shimmername_combined.json
+                parts = filename.replace("_combined.json", "").split("_")
+                if len(parts) >= 2:
+                    # Try to parse date (format: YYYY-MM-DD)
+                    potential_date = parts[1]
+                    try:
+                        # Validate it's a date
+                        datetime.strptime(potential_date, "%Y-%m-%d")
+                        processed_dates.add(potential_date)
+                    except ValueError:
+                        # Not a date, skip
+                        pass
+        
+        print(f"Found {len(processed_dates)} dates already processed")
+        
+        # Step 3: Find missing dates
+        missing_dates = sorted(list(all_dates - processed_dates))
+        
+        # Filter out future dates (but allow today)
+        today = datetime.now(timezone.utc).date()
+        missing_dates = [
+            d for d in missing_dates 
+            if datetime.strptime(d, "%Y-%m-%d").date() <= today
+        ]
+        
+        print(f"Found {len(missing_dates)} missing dates to process")
+        if missing_dates:
+            print(f"Missing dates: {missing_dates}")
+        
+        if not missing_dates:
+            # Return debug info to help identify the issue
+            all_dates_list = sorted(list(all_dates))
+            processed_dates_list = sorted(list(processed_dates))
+            return {
+                "message": "All dates are already processed (or missing date is in the future)",
+                "total_dates": len(all_dates),
+                "processed_dates": len(processed_dates),
+                "all_dates_list": all_dates_list,
+                "processed_dates_list": processed_dates_list,
+                "missing_dates": [],
+                "processed": []
+            }
+        
+        # Step 4: Apply limit if provided
+        if limit and limit > 0:
+            missing_dates = missing_dates[:limit]
+            print(f"Processing limited to {limit} dates")
+        
+        # Step 5: Process each missing date
+        results = []
+        errors = []
+        
+        for date in missing_dates:
+            print(f"\nProcessing date: {date}")
+            try:
+                # Check if files exist for this date
+                file_records = get_files_for_date(date)
+                if not file_records:
+                    print(f"No files found for date {date}, skipping")
+                    errors.append({
+                        "date": date,
+                        "error": "No files found for this date"
+                    })
+                    continue
+                
+                # Process using lambda_handler
+                event = {"date": date}
+                response = lambda_handler(event, None)
+                body = json.loads(response["body"])
+                
+                if response["statusCode"] == 200:
+                    results.append({
+                        "date": date,
+                        "status": "success",
+                        "shimmer_groups_processed": body.get("shimmer_groups_processed", 0),
+                        "results": body.get("results", [])
+                    })
+                else:
+                    errors.append({
+                        "date": date,
+                        "error": body.get("error", "Unknown error"),
+                        "status_code": response["statusCode"]
+                    })
+            except Exception as e:
+                print(f"Error processing date {date}: {e}")
+                errors.append({
+                    "date": date,
+                    "error": str(e)
+                })
+        
+        return {
+            "message": f"Backfill completed: {len(results)} successful, {len(errors)} errors",
+            "total_dates_in_system": len(all_dates),
+            "already_processed": len(processed_dates),
+            "missing_dates_found": len(missing_dates),
+            "dates_processed": len(results),
+            "dates_failed": len(errors),
+            "successful": results,
+            "errors": errors
+        }
+    
+    except ImportError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not import daily_aggregator_handler: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
