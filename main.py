@@ -2191,3 +2191,41 @@ def backfill_missing_dates(limit: Optional[int] = Body(None, embed=True)):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+from fastapi.responses import JSONResponse
+from daily_aggregator_handler import get_files_for_date
+# New endpoint: download ZIP of all raw files for a given recordedTimestamp date (from DynamoDB)
+@app.get("/download-zip-by-date/{date}")
+def download_zip_by_date(date: str):
+    """
+    Query DynamoDB for all files with recordedTimestamp date == date, zip all raw files (full_file_name), upload the zip to S3, and return a presigned download URL.
+    """
+    try:
+        files = get_files_for_date(date)
+        if not files:
+            return JSONResponse(status_code=404, content={"detail": "No files found for this date."})
+
+        s3_keys = [f["full_file_name"] for f in files if "full_file_name" in f]
+        if not s3_keys:
+            return JSONResponse(status_code=404, content={"detail": "No raw file S3 keys found for files on this date."})
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zipf:
+            for key in s3_keys:
+                try:
+                    s3_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+                    file_bytes = s3_obj["Body"].read()
+                    zipf.writestr(os.path.basename(key), file_bytes)
+                except Exception as e:
+                    print(f"Error reading S3 key {key}: {e}")
+        zip_buffer.seek(0)
+        zip_key = f"{date}_raw_files.zip"
+        s3_client.upload_fileobj(zip_buffer, S3_BUCKET, zip_key)
+        url = s3_client.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": S3_BUCKET, "Key": zip_key},
+            ExpiresIn=3600
+        )
+        return {"download_url": url, "count": len(s3_keys)}
+    except (BotoCoreError, ClientError) as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
