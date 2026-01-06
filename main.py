@@ -2049,14 +2049,11 @@ def backfill_missing_dates(limit: Optional[int] = Body(None, embed=True)):
             for item in response.get("Items", []):
                 recorded_ts = item.get("recordedTimestamp")
                 if recorded_ts:
+                    # Only use recordedTimestamp date, not filename date
                     date = extract_date_from_recorded_timestamp(recorded_ts)
                     if date:
                         all_dates.add(date)
-                else:
-                    # Fallback to date field
-                    date = item.get("date")
-                    if date and date != "none":
-                        all_dates.add(date)
+                # No fallback - only use recordedTimestamp
             
             if "LastEvaluatedKey" in response:
                 scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
