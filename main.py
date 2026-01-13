@@ -2196,18 +2196,82 @@ from fastapi.responses import JSONResponse
 from daily_aggregator_handler import get_files_for_date
 # New endpoint: download ZIP of all raw files for a given recordedTimestamp date (from DynamoDB)
 @app.get("/download-zip-by-date/{date}")
-def download_zip_by_date(date: str):
+def download_zip_by_date(date: str, user: Optional[str] = Query(None)):
     """
-    Query DynamoDB for all files with recordedTimestamp date == date, zip all raw files (full_file_name), upload the zip to S3, and return a presigned download URL.
+    Query DynamoDB for all files with recordedTimestamp date == date, 
+    optionally filter by patient name (user), zip all raw files (full_file_name), 
+    upload the zip to S3, and return a presigned download URL.
+    
+    Args:
+        date: Date in YYYY-MM-DD format (filtered by recordedTimestamp)
+        user: Optional patient name to filter files by device-patient mapping
     """
     try:
+        # Get all files for the date (uses recordedTimestamp)
         files = get_files_for_date(date)
         if not files:
             return JSONResponse(status_code=404, content={"detail": "No files found for this date."})
 
+        # If user parameter is provided, filter by patient name
+        if user:
+            # Load device-patient mapping from DynamoDB
+            mapping_table_name = os.getenv("DDB_TABLE")
+            if not mapping_table_name:
+                return JSONResponse(
+                    status_code=500, 
+                    content={"detail": "DDB_TABLE env not set - cannot filter by user"}
+                )
+            
+            ddb = boto3.resource("dynamodb")
+            mapping_table = ddb.Table(mapping_table_name)
+            
+            # Get all devices mapped to this patient
+            devices_for_patient = set()
+            scan_kwargs = {"ProjectionExpression": "device, patient"}
+            while True:
+                response = mapping_table.scan(**scan_kwargs)
+                for item in response.get("Items", []):
+                    device = item.get("device")
+                    patient = item.get("patient")
+                    # Case-insensitive comparison
+                    if device and patient and patient.lower() == user.lower():
+                        devices_for_patient.add(device)
+                
+                if "LastEvaluatedKey" in response:
+                    scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+                else:
+                    break
+            
+            if not devices_for_patient:
+                return JSONResponse(
+                    status_code=404, 
+                    content={"detail": f"No devices found for patient/user: {user}"}
+                )
+            
+            # Filter files to only those from devices mapped to this patient
+            filtered_files = [
+                f for f in files 
+                if f.get("device") in devices_for_patient
+            ]
+            
+            if not filtered_files:
+                return JSONResponse(
+                    status_code=404, 
+                    content={
+                        "detail": f"No files found for date {date} and user {user}",
+                        "date": date,
+                        "user": user
+                    }
+                )
+            
+            files = filtered_files
+
         s3_keys = [f["full_file_name"] for f in files if "full_file_name" in f]
         if not s3_keys:
-            return JSONResponse(status_code=404, content={"detail": "No raw file S3 keys found for files on this date."})
+            return JSONResponse(
+                status_code=404, 
+                content={"detail": "No raw file S3 keys found for files on this date."}
+            )
 
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w") as zipf:
@@ -2218,14 +2282,33 @@ def download_zip_by_date(date: str):
                     zipf.writestr(os.path.basename(key), file_bytes)
                 except Exception as e:
                     print(f"Error reading S3 key {key}: {e}")
+        
         zip_buffer.seek(0)
+        
+        # Include user in ZIP filename if provided
         zip_key = f"{date}_raw_files.zip"
+        if user:
+            # Clean user name for filename (remove special characters)
+            user_clean = user.replace("/", "_").replace(" ", "_")
+            zip_key = f"{date}_{user_clean}_raw_files.zip"
+        
         s3_client.upload_fileobj(zip_buffer, S3_BUCKET, zip_key)
         url = s3_client.generate_presigned_url(
             ClientMethod="get_object",
             Params={"Bucket": S3_BUCKET, "Key": zip_key},
             ExpiresIn=3600
         )
-        return {"download_url": url, "count": len(s3_keys)}
+        
+        response_data = {
+            "download_url": url, 
+            "count": len(s3_keys),
+            "date": date
+        }
+        
+        if user:
+            response_data["user"] = user
+        
+        return response_data
+        
     except (BotoCoreError, ClientError) as e:
         return JSONResponse(status_code=500, content={"detail": str(e)})
