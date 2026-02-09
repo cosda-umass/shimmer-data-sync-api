@@ -9,6 +9,7 @@ RESTful API for managing and processing Shimmer wearable sensor data in the clou
 - [Calibration and Decoding Script](#calibration-and-decoding-script-improvements)
 - [API Endpoints](#key-endpoints)
 - [Setup](#setup)
+- [UI deployment (AWS Amplify)](#ui-deployment-aws-amplify)
 - [Architecture Overview](#architecture-overview)
 - [DynamoDB Size Limit Solution](#dynamodb-size-limit-solution)
 - [Project Structure](#project-structure)
@@ -162,14 +163,8 @@ RESTful API for managing and processing Shimmer wearable sensor data in the clou
 - `GET /files/metadata/` - Get files grouped by device/date/patient
 - `GET /files/combined-meta/` - Get combined metadata from DynamoDB
 - `GET /download/{filename}` - Download file
-- `GET /download-zip-by-date/{date}` - Download ZIP of all raw files for a given date
-  - Uses `recordedTimestamp` from DynamoDB to determine actual recording date (NOT filename date)
-  - Query param (optional): `user` - Filter files by patient name (case-insensitive)
-  - Example: `GET /download-zip-by-date/2026-01-13?user=user1`
-  - Returns presigned download URL and file count
-  - ZIP filename format: `{date}_raw_files.zip` or `{date}_{user}_raw_files.zip` if user provided
-- `POST /download-zip-by-day/` - Download all files for a date (uses filename date)
-- `POST /download-zip-by-user-date/` - Download files for user/date (accepts file list from metadata)
+- `POST /download-zip-by-day/` - Download all files for a date
+- `POST /download-zip-by-user-date/` - Download files for user/date
 
 ### Sensor Data Processing
 - `GET /file/decode/` - Decode sensor file (returns full data)
