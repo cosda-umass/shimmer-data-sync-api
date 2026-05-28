@@ -84,11 +84,13 @@ RESTful API for managing and processing Shimmer wearable sensor data in the clou
 - Scalable architecture for large sensor datasets
 
 ### API Endpoints
-- File operations (upload, download, list, search)
+- File operations (upload, download, list, deconstructed filename parsing)
 - Device-patient mapping (CRUD operations)
-- File metadata with grouping by device/date
-- Decode and store sensor data
-- Retrieve full decoded data from S3
+- File metadata and combined-meta with time-based grouping
+- Decode and store sensor data (`recordedTimestamp` + `endRecordedTimestamp`)
+- Decode backfill (single file or batched pending files)
+- Retrieve decoded fields / full JSON from S3
+- Daily aggregation and backfill for missing combined dates
 
 ## Tech Stack
 - **Backend**: FastAPI with Mangum (AWS Lambda compatible)
@@ -157,19 +159,37 @@ RESTful API for managing and processing Shimmer wearable sensor data in the clou
 
 ## Key Endpoints
 
+Base URL example: `https://odb777ddnc.execute-api.us-east-2.amazonaws.com`
+
 ### File Management
-- `POST /upload/` - Upload Shimmer sensor file
-- `GET /files/` - List all files
-- `GET /files/metadata/` - Get files grouped by device/date/patient
-- `GET /files/combined-meta/` - Get combined metadata from DynamoDB
+- `POST /upload/` - Upload Shimmer sensor file (header metadata to DynamoDB; does not set `recordedTimestamp` from `timestampCal`)
+- `GET /files/` - List all S3 object keys
+- `GET /files/by-day/` - List files grouped by date (`YYYY-MM-DD`)
+- `GET /files/metadata/` - Files grouped by device/date/patient; uses `recordedTimestamp` from DynamoDB when available
+- `GET /files/deconstructed/` - List raw S3 uploads with filename parsed into fields (`device`, `date`, `time`, `shimmer_device`, etc.); date/time from filename only, not `timestampCal`
+- `GET /file/parse-name/` - Parse one filename; query param `filename`
+- `GET /files/combined-meta/` - Decoded metadata from DynamoDB + patient mapping, time-grouped (`GROUP_WINDOW_SECONDS`, default 15s). Each item in `shimmer1_decoded` / `shimmer2_decoded` includes `recordedTimestamp`, `endRecordedTimestamp`, and `decode_s3_key`
 - `GET /download/{filename}` - Download file
-- `POST /download-zip-by-day/` - Download all files for a date
-- `POST /download-zip-by-user-date/` - Download files for user/date
+- `POST /download-zip-by-day/` - ZIP all S3 files for a calendar date (filename date)
+- `POST /download-zip-by-user-date/` - ZIP files from a metadata list (body: array of `{fullname, ...}`)
+- `GET /download-zip-by-date/{date}` - ZIP raw files whose DynamoDB `recordedTimestamp` date matches `YYYY-MM-DD`; optional query `user` (patient filter)
+- `GET /generate-upload-url/` - Presigned S3 upload URL
+- `GET /generate-download-url/` - Presigned S3 download URL
+- `GET /download-all-url/` - Presigned URL for bulk download
+- `POST /missing-files/` - Compare expected vs present files
 
 ### Sensor Data Processing
-- `GET /file/decode/` - Decode sensor file (returns full data)
-- `POST /decode-and-store/` - Decode and store (summary in DDB, full data in S3)
-- `GET /file/decoded-full/` - Retrieve full decoded data from S3
+- `GET /file/decode/` - Decode sensor file in memory (returns full data)
+- `POST /decode-and-store/` - Full decode: large arrays → S3 `decode/{base}_decoded.json`, summary + timestamps → DynamoDB
+  - Body: `{"full_file_name": "device__YYYYMMDD_HHMMSS__...__000.txt"}`
+  - Sets `recordedTimestamp` from `timestampCal[0]` and `endRecordedTimestamp` from `timestampCal[-1]` (UTC ISO)
+- `POST /decode-and-store/backfill/` - Re-decode one or many raw uploads to refresh timestamps in DynamoDB
+  - Single file: `{"full_file_name": "device__...__000.txt"}`
+  - Batch (API Gateway safe): `{"limit": 3}` — processes next pending files; repeat until `processed` is 0
+  - Options: `skip_existing` (default `true`, skip rows that already have `endRecordedTimestamp`), `force` (`true` to re-decode anyway)
+  - Response includes `pending_remaining` when running in batch mode
+- `GET /get-decoded-field-direct/` - Read one field from S3 decoded JSON; query `full_file_name`, `field_name`
+- `GET /get-decoded-file-url/` - Presigned URL for full decoded JSON in S3
 
 ### Device/Patient Mapping
 - `GET /ddb/device-patient-map` - List all mappings
@@ -185,6 +205,8 @@ RESTful API for managing and processing Shimmer wearable sensor data in the clou
   - Saves combined data to `combinedbyDay/` folder with format: `device_date_shimmername_combined.json`
   - Request body (optional): `{"date": "2025-12-11"}` - if omitted, processes next unprocessed date
   - Can be scheduled via EventBridge (e.g., daily at 11:45 PM IST)
+- `POST /daily-aggregator/backfill/` - Process dates that have DynamoDB files but no `combinedbyDay/` output yet
+  - Body (optional): `{"limit": 10}` — max dates per invocation (API Gateway may timeout on large runs)
 
 ### Combined Data Files
 - `GET /combined-data-files/` - List all combined data files from `combinedbyDay/` folder
@@ -203,23 +225,43 @@ RESTful API for managing and processing Shimmer wearable sensor data in the clou
 ### DynamoDB Size Limit Solution
 Shimmer files can contain 60,000+ samples, making arrays too large for DynamoDB's 400KB item limit. Our solution:
 
-1. **Full decoded data** → Stored in S3 at `decoded/{filename}.json`
-2. **Summary metrics** → Stored in DynamoDB (num_samples, accel_wr_var, etc.)
-3. **Reference link** → DynamoDB item includes `decoded_s3_key` for full data retrieval
-4. **Recording timestamp** → DynamoDB includes `recordedTimestamp` field with human-readable ISO format timestamp (e.g., `2024-09-24T22:38:36+00:00`)
-   - Shimmer files store timestamps as Unix timestamps (seconds since epoch) in the `timestampCal` array
-   - The first value from `timestampCal[0]` is extracted and converted from Unix format to ISO 8601 format with UTC timezone
-   - This provides quick access to recording start time without fetching the full 60k-sample timestamp array from S3
+1. **Full decoded data** → Stored in S3 at `decode/{base_name}_decoded.json`
+2. **Summary metrics** → Stored in DynamoDB (e.g. `sampleRate`, `Accel_WR_VAR`, etc.)
+3. **Reference link** → DynamoDB item includes `decode_s3_key` for full data retrieval
+4. **Recording window (metadata only)** — set by `POST /decode-and-store/` or backfill:
+   - `recordedTimestamp` — from `timestampCal[0]`, converted to UTC ISO 8601 (e.g. `2025-12-11T16:32:13.191559+00:00`)
+   - `endRecordedTimestamp` — from `timestampCal[-1]`, same conversion (recording end)
+   - Full per-sample `timestampCal` remains in the S3 decoded JSON only
+5. **Filename fields** — `timestamp`, `date`, `time` parsed from the S3 key (`device__YYYYMMDD_HHMMSS__...`); used as fallback when `recordedTimestamp` is missing
 
-  **Note:** The `recordedTimestamp` is rounded down to the nearest lower 10-second boundary (e.g., 39 and 32 become 30) for consistency in metadata. The original `timestampCal` array in the decoded data is not modified and retains its full precision.
+`GET /files/combined-meta/` and `GET /files/metadata/` prefer **`recordedTimestamp`** (and expose **`endRecordedTimestamp`**) over filename date/time for grouping and UI start/end columns.
 
-This keeps DynamoDB items small (~2-5 KB) while preserving full data access via S3 and providing quick access to key metadata like recording start time.
+This keeps DynamoDB items small (~2–5 KB) while preserving full data access via S3 and avoiding frontend fetches of `timestampCal` for start/end display.
+
+### Backfill existing files
+After deploying timestamp changes, refresh DynamoDB for old uploads:
+
+```bash
+# One file
+curl -X POST "$API/decode-and-store/backfill/" \
+  -H "Content-Type: application/json" \
+  -d '{"full_file_name": "device__20251211_223308__...__000.txt"}'
+
+# Batch (repeat until processed=0; ~3 files per call avoids API Gateway timeout)
+curl -X POST "$API/decode-and-store/backfill/" \
+  -H "Content-Type: application/json" \
+  -d '{"limit": 3}'
+```
+
+For hundreds of files, use `run_backfill_all.py` locally (one HTTP request per file).
 
 ## Project Structure
 ```
 .
 ├── main.py                    # FastAPI application & endpoints
 ├── shimmerCalibrate.py        # Calibrated decoder with inertial cal
+├── daily_aggregator_handler.py
+├── run_backfill_all.py        # Optional: backfill all raw files via API (one file per request)
 ├── test/                      # scripts to test the decoder code
 └── README.md
 ```
