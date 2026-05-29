@@ -28,6 +28,19 @@ from shimmerCaliberate import read_shimmer_dat
 # Load environment variables from .env if present
 load_dotenv()
 
+
+def timestamp_cal_to_iso(decoded: Dict[str, Any], index: int) -> Optional[str]:
+    """Convert timestampCal[index] (Unix seconds) to UTC ISO string."""
+    cal = decoded.get("timestampCal")
+    if not isinstance(cal, list) or len(cal) == 0:
+        return None
+    try:
+        unix_timestamp = float(cal[index])
+        dt = datetime.fromtimestamp(unix_timestamp, tz=timezone.utc)
+        return dt.isoformat()
+    except (ValueError, TypeError, OSError, IndexError):
+        return None
+
 # For AWS Lambda, credentials and region are automatically provided by the environment.
 # Only S3_BUCKET should be loaded from environment variables.
 S3_BUCKET = os.getenv("S3_BUCKET")
@@ -1082,149 +1095,6 @@ def get_deconstructed_files():
         return {"data": [], "error": str(e)}
 
 
-# @app.get("/files/combined-meta/")
-# def get_combined_meta():
-#     """
-#     Combines decoded file metadata from DynamoDB with patient mapping.
-#     Each record includes S3 pointer ('decode_s3_key') to full decoded arrays.
-#     Excludes heavy fields like headerBytes and raw sensor channels.
-#     STRICTLY enforces one record per shimmer per group (max 2 records per group).
-#     """
-#     try:
-#         # ----------- Load decoded metadata -----------
-#         file_table_name = os.getenv("DDB_FILE_TABLE")
-#         if not file_table_name:
-#             return {"data": [], "error": "DDB_FILE_TABLE env not set"}
-
-#         ddb = boto3.resource("dynamodb")
-#         file_table = ddb.Table(file_table_name)
-#         items = []
-#         scan_kwargs = {}
-#         while True:
-#             resp = file_table.scan(**scan_kwargs)
-#             items.extend(resp.get("Items", []))
-#             if "LastEvaluatedKey" in resp:
-#                 scan_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
-#             else:
-#                 break
-
-#         # ----------- Load patient mapping -----------
-#         mapping_table_name = os.getenv("DDB_TABLE")
-#         mapping_table = ddb.Table(mapping_table_name) if mapping_table_name else None
-
-#         from collections import defaultdict
-        
-#         # Group by (patient, device, date, within 15 sec)
-#         # 1. Collect all records by (patient, device, date)
-#         records_by_key = defaultdict(list)
-#         for item in items:
-#             device = item.get("device", "none")
-#             date = item.get("date", "none")
-#             shimmer_name = item.get("shimmer_device", "none")
-#             decode_s3_key = item.get("decode_s3_key", None)
-#             # Get patient
-#             patient = "none"
-#             if mapping_table and device != "none":
-#                 try:
-#                     resp = mapping_table.get_item(Key={"device": device})
-#                     patient = resp.get("Item", {}).get("patient", "none")
-#                 except Exception:
-#                     pass
-#             # Remove unneeded heavy keys (just in case)
-#             EXCLUDE_KEYS = {"headerBytes", "Accel_LN_X", "Accel_LN_Y", "Accel_LN_Z",
-#                             "Gyro_X", "Gyro_Y", "Gyro_Z", "Mag_X", "Mag_Y", "Mag_Z"}
-#             record = {k: v for k, v in item.items() if k not in EXCLUDE_KEYS}
-#             record["decode_s3_key"] = decode_s3_key
-#             record["shimmer_name"] = shimmer_name
-#             record["patient"] = patient
-#             # Parse timestamp as unix
-#             recorded_ts = item.get("recordedTimestamp")
-#             try:
-#                 ts_unix = None
-#                 if recorded_ts and isinstance(recorded_ts, str):
-#                     ts_unix = datetime.fromisoformat(recorded_ts.replace("Z", "+00:00")).timestamp()
-#             except Exception:
-#                 ts_unix = None
-#             record["_ts_unix"] = ts_unix
-#             records_by_key[(patient, device, date)].append(record)
-
-#         # Build device->shimmer1/shimmer2 mapping for assignment
-#         shimmer_map = {}
-#         if mapping_table_name:
-#             scan_kwargs = {"ProjectionExpression": "device, shimmer1, shimmer2"}
-#             while True:
-#                 mresp = mapping_table.scan(**scan_kwargs)
-#                 for it in mresp.get("Items", []):
-#                     dev = it.get("device")
-#                     s1 = it.get("shimmer1")
-#                     s2 = it.get("shimmer2")
-#                     if dev:
-#                         shimmer_map[dev] = {"shimmer1": s1, "shimmer2": s2}
-#                 if "LastEvaluatedKey" in mresp:
-#                     scan_kwargs["ExclusiveStartKey"] = mresp["LastEvaluatedKey"]
-#                 else:
-#                     break
-
-#         grouped = defaultdict(lambda: {"shimmer1_decoded": [], "shimmer2_decoded": []})
-        
-#         for key, recs in records_by_key.items():
-#             # Sort by timestamp
-#             recs = sorted([r for r in recs if r["_ts_unix"] is not None], key=lambda r: r["_ts_unix"])
-            
-#             group_id = 0
-#             prev_ts = None
-#             group_shimmer_count = {}  # Track how many of each shimmer type in current group
-            
-#             for rec in recs:
-#                 shimmer_name = rec["shimmer_name"]
-#                 device = key[1]
-#                 mapping = shimmer_map.get(device, {})
-#                 s1 = mapping.get("shimmer1")
-#                 s2 = mapping.get("shimmer2")
-                
-#                 # Determine shimmer type (1 or 2)
-#                 shimmer_type = None
-#                 if s1 and shimmer_name == s1:
-#                     shimmer_type = "shimmer1"
-#                 elif s2 and shimmer_name == s2:
-#                     shimmer_type = "shimmer2"
-#                 else:
-#                     # Fallback logic
-#                     shimmer_type = "shimmer1" if shimmer_name == s1 else "shimmer2"
-                
-#                 # Check if we need a new group
-#                 # Start new group if: no prev_ts, gap > 15s, OR current shimmer type already exists in group
-#                 if (prev_ts is None or 
-#                     rec["_ts_unix"] - prev_ts > GROUP_WINDOW_SECONDS or
-#                     group_shimmer_count.get(shimmer_type, 0) > 0):
-#                     group_id += 1
-#                     group_shimmer_count = {}  # Reset counter for new group
-                
-#                 group_key = (*key, f"group{group_id}")
-#                 group = grouped[group_key]
-#                 group["device"] = key[1]
-#                 group["date"] = key[2]
-#                 group["patient"] = key[0]
-#                 group["group_id"] = f"group{group_id}"
-                
-#                 # Add to appropriate shimmer list
-#                 if shimmer_type == "shimmer1":
-#                     group["shimmer1"] = shimmer_name
-#                     group["shimmer1_decoded"].append(rec)
-#                 else:
-#                     group["shimmer2"] = shimmer_name
-#                     group["shimmer2_decoded"].append(rec)
-                
-#                 # Update counters
-#                 group_shimmer_count[shimmer_type] = group_shimmer_count.get(shimmer_type, 0) + 1
-#                 prev_ts = rec["_ts_unix"]
-
-#         result = list(grouped.values())
-#         return {"data": result, "error": None}
-
-#     except Exception as e:
-#         return {"data": [], "error": str(e)}
-
 @app.get("/files/combined-meta/")
 def get_combined_meta():
     """
@@ -1305,6 +1175,12 @@ def get_combined_meta():
             record["shimmer_name"] = shimmer_name
             record["patient"] = patient
             record["date"] = date
+
+            # Pass through recording window from DynamoDB (set by /decode-and-store/)
+            if item.get("recordedTimestamp") is not None:
+                record["recordedTimestamp"] = item.get("recordedTimestamp")
+            if item.get("endRecordedTimestamp") is not None:
+                record["endRecordedTimestamp"] = item.get("endRecordedTimestamp")
 
             # Parse timestamp as UNIX
             recorded_ts = item.get("recordedTimestamp")
@@ -1440,9 +1316,12 @@ def get_combined_meta():
             if curr_group:
                 grouped.append(curr_group)
 
-        # Remove helper keys
+        # Remove helper keys from groups and nested decoded records
         for g in grouped:
             g.pop("_last_ts", None)
+            for decoded_key in ("shimmer1_decoded", "shimmer2_decoded"):
+                for rec in g.get(decoded_key, []):
+                    rec.pop("_ts_unix", None)
 
         return {"data": grouped, "error": None}
 
@@ -1450,69 +1329,165 @@ def get_combined_meta():
         return {"data": [], "error": str(e)}
 
 
-# Place this endpoint after app = FastAPI() initialization
+# --- decode-and-store helpers ---
 
-@app.post("/decode-and-store/")
-def decode_and_store(full_file_name: str = Body(..., embed=True)):
+DECODE_STORE_EXCLUDE_KEYS = {
+    "timestamp", "headerInfo", "headerBytes", "channelNames", "packetLengthBytes",
+    "Accel_LN_X", "Accel_LN_Y", "Accel_LN_Z", "VSenseBatt",
+    "Gyro_X", "Gyro_Y", "Gyro_Z",
+    "Accel_WR_X", "Accel_WR_Y", "Accel_WR_Z",
+    "Mag_X", "Mag_Y", "Mag_Z",
+    "Accel_WR_y",
+}
+
+
+def parse_decode_filename(fname: str) -> Dict[str, Any]:
+    parts = fname.split("__")
+    device = parts[0] if len(parts) > 0 else "none"
+    timestamp = parts[1] if len(parts) > 1 else "none"
+    experiment_name = parts[2] if len(parts) > 2 else "none"
+    shimmer_field = parts[3] if len(parts) > 3 else "none"
+    filename = parts[5] if len(parts) > 5 else "none"
+
+    shimmer_device = shimmer_field
+    shimmer_day = "none"
+    if shimmer_field != "none" and "-" in shimmer_field:
+        shimmer_device, shimmer_day = shimmer_field.rsplit("-", 1)
+
+    ext, part = "", None
+    if filename and "." in filename:
+        ext = filename.split(".")[-1]
+        part = filename.split(".")[0]
+    elif filename:
+        part = filename
+
+    date, time = "none", "none"
+    if timestamp and "_" in timestamp:
+        ymd, hms = timestamp.split("_", 1)
+        if len(ymd) == 8 and len(hms) == 6:
+            date = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+            time = f"{hms[:2]}:{hms[2:4]}:{hms[4:6]}"
+
+    return {
+        "full_file_name": fname,
+        "device": device,
+        "timestamp": timestamp,
+        "date": date,
+        "time": time,
+        "experiment_name": experiment_name,
+        "shimmer_device": shimmer_device,
+        "shimmer_day": shimmer_day,
+        "filename": filename,
+        "ext": ext,
+        "part": part,
+    }
+
+
+def _is_raw_upload_s3_key(key: str) -> bool:
+    if not key or key.endswith("/"):
+        return False
+    if key.lower().endswith(".zip"):
+        return False
+    for prefix in ("decode/", "combinedbyDay/", "daily-aggregated/"):
+        if key.startswith(prefix):
+            return False
+    return True
+
+
+def list_raw_upload_s3_keys() -> List[str]:
+    if not S3_BUCKET:
+        raise HTTPException(status_code=500, detail="S3_BUCKET env not set")
+    keys: List[str] = []
+    response = s3_client.list_objects_v2(Bucket=S3_BUCKET)
+    while True:
+        for obj in response.get("Contents", []):
+            key = obj.get("Key")
+            if key and _is_raw_upload_s3_key(key):
+                keys.append(key)
+        if not response.get("IsTruncated"):
+            break
+        response = s3_client.list_objects_v2(
+            Bucket=S3_BUCKET,
+            ContinuationToken=response.get("NextContinuationToken"),
+        )
+    return sorted(keys)
+
+
+def _ddb_keys_with_end_recorded_timestamp() -> set:
+    """Return full_file_name values that already have endRecordedTimestamp in DDB."""
+    file_table_name = os.getenv("DDB_FILE_TABLE")
+    if not file_table_name:
+        return set()
+    done: set = set()
+    ddb = boto3.resource("dynamodb")
+    table = ddb.Table(file_table_name)
+    scan_kwargs = {"ProjectionExpression": "full_file_name, endRecordedTimestamp"}
+    while True:
+        resp = table.scan(**scan_kwargs)
+        for item in resp.get("Items", []):
+            fname = item.get("full_file_name")
+            if fname and item.get("endRecordedTimestamp"):
+                done.add(fname)
+        if "LastEvaluatedKey" not in resp:
+            break
+        scan_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+    return done
+
+
+def list_backfill_pending_keys(skip_existing: bool = True) -> List[str]:
+    keys = list_raw_upload_s3_keys()
+    if not skip_existing:
+        return keys
+    done = _ddb_keys_with_end_recorded_timestamp()
+    return [k for k in keys if k not in done]
+
+
+def resolve_s3_key(full_file_name: str) -> str:
+    """Resolve S3 key; try .txt if truncated or missing extension."""
+    if not S3_BUCKET:
+        raise HTTPException(status_code=500, detail="S3_BUCKET env not set")
+    candidates = [full_file_name]
+    if full_file_name.endswith(".tx"):
+        candidates.append(full_file_name + "t")
+    if "." not in os.path.basename(full_file_name):
+        candidates.append(full_file_name + ".txt")
+    seen = set()
+    for key in candidates:
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            s3_client.head_object(Bucket=S3_BUCKET, Key=key)
+            return key
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") not in ("404", "NoSuchKey", "NotFound"):
+                raise
+    raise HTTPException(status_code=404, detail=f"File not found in S3: {full_file_name}")
+
+
+def _convert_floats_for_ddb(obj: Any) -> Any:
+    if isinstance(obj, float):
+        return Decimal(str(obj))
+    if isinstance(obj, dict):
+        return {k: _convert_floats_for_ddb(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_convert_floats_for_ddb(v) for v in obj]
+    return obj
+
+
+def decode_and_store_file(full_file_name: str) -> Dict[str, Any]:
     """
-    Given a full S3 filename, download, decode header, and store metadata in DynamoDB file table.
-    Large decoded arrays and unnecessary raw fields (like headerBytes) are stored in S3 under 'decode/'.
-    DynamoDB stores only lightweight metadata + pointer to decode_s3_key.
+    Download raw file from S3, decode, write decode/ JSON + DynamoDB metadata.
+    Returns success dict or {"error": "..."}.
     """
-    print(f"[decode-and-store] Called with full_file_name: {full_file_name}")
+    print(f"[decode-and-store] Processing: {full_file_name}")
     try:
-        # ----------- Download file from S3 -----------
-        print(f"[decode-and-store] Downloading file from S3: {full_file_name}")
         s3_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=full_file_name)
         file_bytes = s3_obj["Body"].read()
-        print(f"[decode-and-store] Downloaded {len(file_bytes)} bytes from S3.")
+        print(f"[decode-and-store] Downloaded {len(file_bytes)} bytes")
 
-        # ----------- Parse filename -----------
-        def parse_custom_filename(fname):
-            parts = fname.split("__")
-            device = parts[0] if len(parts) > 0 else "none"
-            timestamp = parts[1] if len(parts) > 1 else "none"
-            experiment_name = parts[2] if len(parts) > 2 else "none"
-            shimmer_field = parts[3] if len(parts) > 3 else "none"
-            filename = parts[5] if len(parts) > 5 else "none"
+        meta = parse_decode_filename(full_file_name)
 
-            shimmer_device = shimmer_field
-            shimmer_day = "none"
-            if shimmer_field != "none" and "-" in shimmer_field:
-                shimmer_device, shimmer_day = shimmer_field.rsplit("-", 1)
-
-            ext, part = "", None
-            if filename and "." in filename:
-                ext = filename.split(".")[-1]
-                part = filename.split(".")[0]
-            elif filename:
-                part = filename
-
-            date, time = "none", "none"
-            if timestamp and "_" in timestamp:
-                ymd, hms = timestamp.split("_", 1)
-                if len(ymd) == 8 and len(hms) == 6:
-                    date = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
-                    time = f"{hms[:2]}:{hms[2:4]}:{hms[4:6]}"
-
-            return {
-                "full_file_name": fname,
-                "device": device,
-                "timestamp": timestamp,
-                "date": date,
-                "time": time,
-                "experiment_name": experiment_name,
-                "shimmer_device": shimmer_device,
-                "shimmer_day": shimmer_day,
-                "filename": filename,
-                "ext": ext,
-                "part": part
-            }
-
-        meta = parse_custom_filename(full_file_name)
-        print(f"[decode-and-store] Parsed filename meta: {meta}")
-
-        # ----------- Patient mapping -----------
         patient = None
         try:
             mapping_table_name = os.getenv("DDB_TABLE")
@@ -1521,39 +1496,23 @@ def decode_and_store(full_file_name: str = Body(..., embed=True)):
                 mapping_table = ddb.Table(mapping_table_name)
                 resp = mapping_table.get_item(Key={"device": meta["device"]})
                 patient = resp.get("Item", {}).get("patient")
-                print(f"[decode-and-store] Patient mapping found: {patient}")
         except Exception as e:
-            print(f"[decode-and-store] Error in patient mapping: {e}")
-            patient = None
+            print(f"[decode-and-store] Patient mapping error: {e}")
         if patient:
             meta["patient"] = patient
 
-        # ----------- Decode shimmer data -----------
-        print(f"[decode-and-store] Decoding shimmer data...")
         decoded = read_shimmer_dat(file_bytes)
-        print(f"[decode-and-store] Decoded keys: {list(decoded.keys())}")
 
-        # ----------- Remove unneeded heavy keys (just in case)
-        EXCLUDE_KEYS = {
-            "timestamp", "headerInfo", "headerBytes", "channelNames", "packetLengthBytes",
-            "Accel_LN_X", "Accel_LN_Y", "Accel_LN_Z", "VSenseBatt", 
-            "Gyro_X", "Gyro_Y", "Gyro_Z",
-            "Accel_WR_X", "Accel_WR_Y", "Accel_WR_Z",
-            "Mag_X", "Mag_Y", "Mag_Z",
-            "Accel_WR_y"  # in case of typo variant
-        }
-
-        # ----------- Separate large vs small data -----------
-        large_data, small_data = {}, {}
+        large_data: Dict[str, Any] = {}
+        small_data: Dict[str, Any] = {}
         for k, v in decoded.items():
-            if k in EXCLUDE_KEYS:
+            if k in DECODE_STORE_EXCLUDE_KEYS:
                 continue
             if isinstance(v, (list, dict)) and len(str(v)) > 2000:
                 large_data[k] = v
             else:
                 small_data[k] = v
 
-        # Always include sampleRate in both small_data and large_data
         if "sampleRate" in decoded:
             try:
                 sr = round(float(decoded["sampleRate"]), 2)
@@ -1562,82 +1521,124 @@ def decode_and_store(full_file_name: str = Body(..., embed=True)):
             except Exception:
                 pass
 
-        print(f"[decode-and-store] Large data keys: {list(large_data.keys())}")
-        print(f"[decode-and-store] Small data keys: {list(small_data.keys())}")
-
-        # ----------- Store large data to S3 using presigned URL -----------
-        import json
         decode_key = f"decode/{os.path.splitext(full_file_name)[0]}_decoded.json"
-        presigned_url = s3_client.generate_presigned_url(
-            ClientMethod="put_object",
-            Params={"Bucket": S3_BUCKET, "Key": decode_key, "ContentType": "application/json"},
-            ExpiresIn=600
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=decode_key,
+            Body=json.dumps(large_data),
+            ContentType="application/json",
         )
-        print(f"[decode-and-store] Presigned URL for decoded upload: {presigned_url}")
-        try:
-            import requests
-            resp = requests.put(
-                presigned_url,
-                data=json.dumps(large_data),
-                headers={"Content-Type": "application/json"}
-            )
-            print(f"[decode-and-store] S3 upload response status: {resp.status_code}")
-            if resp.status_code not in [200, 201]:
-                print(f"[decode-and-store] S3 upload error: {resp.text}")
-                return {"error": f"Failed to upload decoded file to S3: {resp.text}"}
-        except ImportError:
-            print("[decode-and-store] requests library is not installed.")
-            return {"error": "requests library is required for presigned URL upload. Please install it."}
 
-        # ----------- Prepare DynamoDB record -----------
-        def convert_floats(obj):
-            from decimal import Decimal
-            if isinstance(obj, float):
-                return Decimal(str(obj))
-            if isinstance(obj, dict):
-                return {k: convert_floats(v) for k, v in obj.items()}
-            if isinstance(obj, list):
-                return [convert_floats(v) for v in obj]
-            return obj
-
-        # Extract recordedTimestamp from first timestampCal value
-        recorded_timestamp = None
-        if "timestampCal" in decoded and isinstance(decoded["timestampCal"], list) and len(decoded["timestampCal"]) > 0:
-            try:
-                unix_timestamp = float(decoded["timestampCal"][0])
-                dt = datetime.fromtimestamp(unix_timestamp, tz=timezone.utc)
-                recorded_timestamp = dt.isoformat()
-            except (ValueError, TypeError, OSError):
-                recorded_timestamp = None
+        recorded_timestamp = timestamp_cal_to_iso(decoded, 0)
+        end_recorded_timestamp = timestamp_cal_to_iso(decoded, -1)
 
         merged = {**meta, **small_data, "decode_s3_key": decode_key}
         if recorded_timestamp is not None:
             merged["recordedTimestamp"] = recorded_timestamp
-        item = convert_floats(merged)
+        if end_recorded_timestamp is not None:
+            merged["endRecordedTimestamp"] = end_recorded_timestamp
+        item = _convert_floats_for_ddb(merged)
         item["updatedAt"] = datetime.now(timezone.utc).isoformat()
-        print(f"[decode-and-store] DynamoDB item prepared: {item}")
 
-        # ----------- Save to DynamoDB -----------
         file_table_name = os.getenv("DDB_FILE_TABLE")
         if not file_table_name:
-            print("[decode-and-store] DDB_FILE_TABLE env not set")
             return {"error": "DDB_FILE_TABLE env not set"}
         ddb = boto3.resource("dynamodb")
         file_table = ddb.Table(file_table_name)
         file_table.put_item(Item=item)
-        print(f"[decode-and-store] Item stored in DynamoDB table: {file_table_name}")
 
-        print(f"[decode-and-store] Returning success response.")
         return {
             "filename": full_file_name,
             "message": "Decode and store successful",
-            "ddb_item": item,
-            "decode_s3_key": decode_key
+            "decode_s3_key": decode_key,
+            "recordedTimestamp": recorded_timestamp,
+            "endRecordedTimestamp": end_recorded_timestamp,
         }
-
     except (BotoCoreError, ClientError, Exception) as e:
-        print(f"[decode-and-store] Exception: {e}")
-        return {"error": str(e)}
+        print(f"[decode-and-store] Exception for {full_file_name}: {e}")
+        traceback.print_exc()
+        return {"error": str(e), "filename": full_file_name}
+
+
+@app.post("/decode-and-store/")
+def decode_and_store(full_file_name: str = Body(..., embed=True)):
+    """
+    Given a full S3 filename, download, decode, and store metadata in DynamoDB file table.
+    Large decoded arrays are stored in S3 under 'decode/'.
+    """
+    print(f"[decode-and-store] Called with full_file_name: {full_file_name}")
+    key = resolve_s3_key(full_file_name)
+    result = decode_and_store_file(key)
+    if result.get("error"):
+        return result
+    return result
+
+
+@app.post("/decode-and-store/backfill/")
+def decode_and_store_backfill(
+    full_file_name: Optional[str] = Body(None),
+    limit: Optional[int] = Body(3),
+    skip_existing: bool = Body(True),
+    force: bool = Body(False),
+):
+    """
+    Re-decode raw S3 uploads and refresh DynamoDB (recordedTimestamp, endRecordedTimestamp).
+
+    - No full_file_name: process pending raw uploads (default limit=3 for API Gateway timeout).
+    - With full_file_name: process only that file (supports truncated .tx → .txt).
+    - skip_existing=True (default): skip files that already have endRecordedTimestamp in DDB.
+    - force=True: re-decode even if endRecordedTimestamp exists (single-file or bulk).
+
+    Body examples:
+      {"limit": 3}  — next 3 pending files (call in a loop until processed=0)
+      {"full_file_name": "device__...__000.txt"}  — single file
+      {"limit": 5, "force": true}  — re-decode up to 5 files even if already done
+    """
+    try:
+        if full_file_name:
+            keys = [resolve_s3_key(full_file_name)]
+        else:
+            keys = list_backfill_pending_keys(skip_existing=skip_existing and not force)
+            if limit is not None and limit > 0:
+                keys = keys[:limit]
+
+        if not keys:
+            return {
+                "processed": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "skipped_existing": skip_existing and not force,
+                "results": [],
+                "errors": [],
+                "message": "No files to process",
+            }
+
+        results: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+        for key in keys:
+            out = decode_and_store_file(key)
+            if out.get("error"):
+                errors.append(out)
+            else:
+                results.append(out)
+
+        pending_remaining = None
+        if not full_file_name:
+            pending_remaining = len(list_backfill_pending_keys(skip_existing=True))
+
+        return {
+            "processed": len(keys),
+            "succeeded": len(results),
+            "failed": len(errors),
+            "pending_remaining": pending_remaining,
+            "results": results,
+            "errors": errors,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/get-decoded-field-direct/")
 def get_decoded_field_direct(

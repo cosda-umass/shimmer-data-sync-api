@@ -17,3 +17,7 @@ comparison_plots_DC95/*
 for_compare/DC95_left.json
 .DS_Store
 for_compare/DC95_left-Decoded.mat
+COST_ESTIMATION.md
+.DS_Store
+*.log
+run_backfill_all*
